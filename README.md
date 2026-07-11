@@ -47,19 +47,21 @@ cd ~/Scripts/bzd-ticket-monitor
 
 Логи: `.cache/monitor.log` и `.cache/monitor.err.log`
 
-## GitHub Actions (24/7, когда Mac включён)
+## GitHub Actions (24/7, Mac может спать)
 
-Облачные runner'ы GitHub получают **403** от pass.rw.by. Решение — **self-hosted runner** на этом Mac (тот же домашний IP, что у локального скрипта).
+pass.rw.by блокирует облако GitHub напрямую, но через **staronki.by** проверка работает автономно.
 
 ```bash
-cd ~/Scripts/bzd-ticket-monitor
-./scripts/install-github-runner.sh   # один раз, попросит пароль для автозапуска службы
+gh workflow run monitor.yml --repo ElenaSamanchuk/bzd-ticket-monitor
 ```
 
-Workflow `monitor.yml` запускается **каждые 5 минут** на `self-hosted`.  
-Состояние уведомлений общее с локальным скриптом: `.cache/notified.json` (без дублей).
+Подробнее: **AUTONOMOUS.md** и **SETUP.md**
 
-Секреты Telegram и почты: **SETUP.md**
+Локальный Mac и self-hosted runner **не нужны**. Чтобы не было дублей:
+
+```bash
+./scripts/uninstall.sh
+```
 
 ## Текущий статус (на момент создания)
 
