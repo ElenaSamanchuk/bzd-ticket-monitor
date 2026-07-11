@@ -35,6 +35,13 @@ caffeinate -i python3 monitor.py
 
 На 13.07.2026 поезда **707Б** и **757Б**: **мест нет** — скрипт будет ждать отказники.
 
+## GitHub (попытка 24/7)
+
+Репозиторий: https://github.com/ElenaSamanchuk/bzd-ticket-monitor
+
+**pass.rw.by часто блокирует IP GitHub (403).** Надёжнее — **Mac дома** (ниже).  
+Секреты для Telegram и почты: **SETUP.md**
+
 ## Notion
 
 Нативной отправки в Notion нет. Проще Telegram или почта. Notion можно подключить через Zapier/Make, если очень нужно.
