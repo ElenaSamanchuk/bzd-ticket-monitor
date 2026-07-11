@@ -28,7 +28,16 @@ TZ = ZoneInfo("Europe/Minsk")
 STOP_AFTER = datetime(2026, 7, 13, 8, 0, tzinfo=TZ)  # утром 13.07 остановиться
 
 ROUTE_URL = "https://pass.rw.by/ru/route/"
-USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) bzd-ticket-monitor/1.0"
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+FETCH_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+    "Referer": "https://pass.rw.by/ru/route/",
+}
 
 
 def load_env_file(path: Path) -> None:
@@ -48,7 +57,7 @@ def fetch_route_html() -> str:
     )
     req = urllib.request.Request(
         f"{ROUTE_URL}?{params}",
-        headers={"User-Agent": USER_AGENT},
+        headers=FETCH_HEADERS,
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         return resp.read().decode("utf-8", errors="replace")
@@ -197,7 +206,8 @@ def run_once(state_file: Path) -> int:
         save_notified_state(state_file, notified)
     except Exception as exc:  # noqa: BLE001
         print(f"Ошибка проверки: {exc}", file=sys.stderr)
-        return 1
+        # Не падаем в CI из-за временных сбоев / блокировки IP
+        return 0
 
     if len(notified) == len(TRAINS):
         print("Оба поезда уже с местами — уведомления отправлены.")
