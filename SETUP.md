@@ -1,6 +1,4 @@
-# Настройка уведомлений (5 минут)
-
-GitHub Actions уже проверяет билеты **каждые 5 минут**, но без секретов письма и Telegram не уйдут.
+# Настройка уведомлений и автозапуска
 
 ## 1. Telegram
 
@@ -33,7 +31,29 @@ gh secret set SMTP_PASSWORD --body "ВАШ_ПАРОЛЬ_ПРИЛОЖЕНИЯ_GMA
 
 Или: GitHub → репозиторий → **Settings → Secrets and variables → Actions**
 
-## 4. Проверка
+## 4. GitHub Actions (self-hosted на Mac)
+
+Облачный `ubuntu-latest` **не работает** — pass.rw.by отдаёт 403.  
+Нужен runner на вашем Mac:
+
+```bash
+cd ~/Scripts/bzd-ticket-monitor
+./scripts/install-github-runner.sh
+```
+
+После установки в GitHub → **Settings → Actions → Runners** появится `mac-home` (Idle).
+
+Workflow использует общий файл состояния с локальным монитором:
+`/Users/elena/Scripts/bzd-ticket-monitor/.cache/notified.json`
+
+## 5. Автозапуск после перезагрузки
+
+```bash
+./scripts/install-launchagent.sh   # локальный монитор каждые 3 мин
+./scripts/status.sh                # проверить, что всё работает
+```
+
+## 6. Проверка
 
 ```bash
 gh workflow run monitor.yml

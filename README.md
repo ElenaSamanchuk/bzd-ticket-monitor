@@ -26,21 +26,43 @@ python3 monitor.py
 
 ```bash
 cd ~/Scripts/bzd-ticket-monitor
-caffeinate -i python3 monitor.py
+./scripts/start.sh
 ```
 
-Остановка: `Ctrl+C`
+Остановка: `Ctrl+C` или `./scripts/stop.sh`
+
+## Автозапуск после перезагрузки Mac
+
+Один раз установите LaunchAgent — дальше мониторинг стартует сам при входе в систему:
+
+```bash
+cd ~/Scripts/bzd-ticket-monitor
+./scripts/install-launchagent.sh
+```
+
+Проверка: `./scripts/status.sh`  
+Остановка: `./scripts/stop.sh`  
+Перезапуск вручную: `./scripts/stop.sh && ./scripts/install-launchagent.sh`
+
+Логи: `.cache/monitor.log` и `.cache/monitor.err.log`
+
+## GitHub Actions (24/7, когда Mac включён)
+
+Облачные runner'ы GitHub получают **403** от pass.rw.by. Решение — **self-hosted runner** на этом Mac (тот же домашний IP, что у локального скрипта).
+
+```bash
+cd ~/Scripts/bzd-ticket-monitor
+./scripts/install-github-runner.sh   # один раз, попросит пароль для автозапуска службы
+```
+
+Workflow `monitor.yml` запускается **каждые 5 минут** на `self-hosted`.  
+Состояние уведомлений общее с локальным скриптом: `.cache/notified.json` (без дублей).
+
+Секреты Telegram и почты: **SETUP.md**
 
 ## Текущий статус (на момент создания)
 
 На 13.07.2026 поезда **707Б** и **757Б**: **мест нет** — скрипт будет ждать отказники.
-
-## GitHub (попытка 24/7)
-
-Репозиторий: https://github.com/ElenaSamanchuk/bzd-ticket-monitor
-
-**pass.rw.by часто блокирует IP GitHub (403).** Надёжнее — **Mac дома** (ниже).  
-Секреты для Telegram и почты: **SETUP.md**
 
 ## Notion
 

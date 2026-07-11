@@ -8,11 +8,13 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # pass.rw.by блокирует IP облачных runner'ов GitHub (403).
+    # Self-hosted на домашнем Mac использует тот же IP, что и локальный monitor.py.
+    runs-on: self-hosted
     timeout-minutes: 5
     env:
       CI: "true"
-      STATE_FILE: .cache/notified.json
+      STATE_FILE: /Users/elena/Scripts/bzd-ticket-monitor/.cache/notified.json
       EMAIL_TO: elenasamanchuk@gmail.com
       EMAIL_FROM: elenasamanchuk@gmail.com
       SMTP_HOST: smtp.gmail.com
@@ -20,11 +22,6 @@ jobs:
       SMTP_USER: elenasamanchuk@gmail.com
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/cache@v4
-        with:
-          path: .cache/notified.json
-          key: bzd-notified-${{ github.repository }}
 
       - name: Check tickets
         env:
