@@ -2,19 +2,18 @@ name: BZD ticket monitor
 
 on:
   schedule:
-    # каждые 5 минут (минимум для GitHub cron)
     - cron: "*/5 * * * *"
   workflow_dispatch:
 
 jobs:
   check:
-    # pass.rw.by блокирует IP облачных runner'ов GitHub (403).
-    # Self-hosted на домашнем Mac использует тот же IP, что и локальный monitor.py.
-    runs-on: self-hosted
+    # pass.rw.by блокирует IP GitHub, но staronki.by (серверы в РБ) — нет.
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
       CI: "true"
-      STATE_FILE: /Users/elena/Scripts/bzd-ticket-monitor/.cache/notified.json
+      BZD_USE_STARONKI: "1"
+      STATE_FILE: .cache/notified.json
       EMAIL_TO: elenasamanchuk@gmail.com
       EMAIL_FROM: elenasamanchuk@gmail.com
       SMTP_HOST: smtp.gmail.com
@@ -22,6 +21,13 @@ jobs:
       SMTP_USER: elenasamanchuk@gmail.com
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .cache/notified.json
+            .cache/staronki_cookies.txt
+          key: bzd-monitor-${{ github.repository }}
 
       - name: Check tickets
         env:

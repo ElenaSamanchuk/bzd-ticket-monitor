@@ -31,29 +31,18 @@ gh secret set SMTP_PASSWORD --body "ВАШ_ПАРОЛЬ_ПРИЛОЖЕНИЯ_GMA
 
 Или: GitHub → репозиторий → **Settings → Secrets and variables → Actions**
 
-## 4. GitHub Actions (self-hosted на Mac)
+## 4. GitHub Actions (автономно, Mac может спать)
 
-Облачный `ubuntu-latest` **не работает** — pass.rw.by отдаёт 403.  
-Нужен runner на вашем Mac:
-
-```bash
-cd ~/Scripts/bzd-ticket-monitor
-./scripts/install-github-runner.sh
-```
-
-После установки в GitHub → **Settings → Actions → Runners** появится `mac-home` (Idle).
-
-Workflow использует общий файл состояния с локальным монитором:
-`/Users/elena/Scripts/bzd-ticket-monitor/.cache/notified.json`
-
-## 5. Автозапуск после перезагрузки
+Workflow использует **staronki.by** как прокси к pass.rw.by — работает с облачных runner'ов.
 
 ```bash
-./scripts/install-launchagent.sh   # локальный монитор каждые 3 мин
-./scripts/status.sh                # проверить, что всё работает
+gh workflow run monitor.yml
+gh run list --workflow=monitor.yml --limit 3
 ```
 
-## 6. Проверка
+Self-hosted runner на Mac **не нужен**. Локальный автозапуск — опционально (`./scripts/uninstall.sh` чтобы выключить).
+
+## 5. Проверка
 
 ```bash
 gh workflow run monitor.yml

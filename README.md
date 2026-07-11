@@ -42,7 +42,8 @@ cd ~/Scripts/bzd-ticket-monitor
 
 Проверка: `./scripts/status.sh`  
 Остановка: `./scripts/stop.sh`  
-Перезапуск вручную: `./scripts/stop.sh && ./scripts/install-launchagent.sh`
+Перезапуск вручную: `./scripts/stop.sh && ./scripts/install-launchagent.sh`  
+**Полное отключение** (когда билеты куплены): `./scripts/uninstall.sh`
 
 Логи: `.cache/monitor.log` и `.cache/monitor.err.log`
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import http.cookiejar
 import json
 import os
 import re
@@ -28,9 +29,20 @@ TZ = ZoneInfo("Europe/Minsk")
 STOP_AFTER = datetime(2026, 7, 13, 8, 0, tzinfo=TZ)  # утром 13.07 остановиться
 
 ROUTE_URL = "https://pass.rw.by/ru/route/"
-USER_AGENT = (
+STARONKI_URL = "https://staronki.by"
+STARONKI_POLL_SEC = 3
+STARONKI_SETUP_TIMEOUT_SEC = 45
+_DEFAULT_UA_MAC = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+_DEFAULT_UA_LINUX = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+USER_AGENT = os.environ.get(
+    "BZD_USER_AGENT",
+    _DEFAULT_UA_MAC if sys.platform == "darwin" else _DEFAULT_UA_LINUX,
 )
 FETCH_HEADERS = {
     "User-Agent": USER_AGENT,
@@ -38,6 +50,131 @@ FETCH_HEADERS = {
     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
     "Referer": "https://pass.rw.by/ru/route/",
 }
+
+
+def use_staronki() -> bool:
+    if os.environ.get("BZD_USE_STARONKI") == "1":
+        return True
+    if os.environ.get("BZD_USE_STARONKI") == "0":
+        return False
+    return os.environ.get("CI") == "true"
+
+
+def route_search_url() -> str:
+    params = urllib.parse.urlencode(
+        {"from": FROM_STATION, "to": TO_STATION, "date": DATE}
+    )
+    return f"{ROUTE_URL}?{params}"
+
+
+class StaronkiClient:
+    """Проверка через staronki.by — их серверы в РБ видят pass.rw.by (для GitHub cloud)."""
+
+    def __init__(self, cookie_file: Path) -> None:
+        self.cookie_file = cookie_file
+        self.cookie_file.parent.mkdir(parents=True, exist_ok=True)
+        self.jar = http.cookiejar.MozillaCookieJar(str(cookie_file))
+        if cookie_file.exists():
+            try:
+                self.jar.load(ignore_discard=True, ignore_expires=True)
+            except OSError:
+                pass
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.jar)
+        )
+
+    def save(self) -> None:
+        self.jar.save(ignore_discard=True, ignore_expires=True)
+
+    def _request(self, url: str, data: dict[str, str] | None = None) -> bytes:
+        headers = {"User-Agent": USER_AGENT}
+        if data is None:
+            req = urllib.request.Request(url, headers=headers)
+        else:
+            body = urllib.parse.urlencode(data).encode()
+            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        with self.opener.open(req, timeout=30) as resp:
+            return resp.read()
+
+    def status(self) -> dict:
+        raw = self._request(f"{STARONKI_URL}/check_status.php")
+        return json.loads(raw.decode("utf-8"))
+
+    def submit_route(self, route_url: str) -> None:
+        self._request(f"{STARONKI_URL}/trains.php", {"url": route_url})
+
+    def select_train(self, train: str, saved_url: str) -> None:
+        self._request(
+            f"{STARONKI_URL}/trains.php",
+            {"select_train": train, "saved_url": saved_url},
+        )
+
+    def wait_for_trains(self) -> dict:
+        deadline = time.time() + STARONKI_SETUP_TIMEOUT_SEC
+        while time.time() < deadline:
+            data = self.status()
+            if data.get("status") == "trains_found" and data.get("trains_list"):
+                return data
+            if data.get("error_msg"):
+                raise RuntimeError(f"staronki.by: {data['error_msg']}")
+            time.sleep(STARONKI_POLL_SEC)
+        raise RuntimeError("staronki.by: таймаут ожидания списка поездов")
+
+    def ensure_monitoring(self) -> None:
+        route_url = route_search_url()
+        data = self.status()
+        active = {
+            task["train_number"]
+            for task in data.get("tasks", [])
+            if task.get("status") == "monitoring"
+            and route_url in (task.get("url") or "")
+            and task.get("train_number") in TRAINS
+            and int(task.get("remains") or 0) > 3
+        }
+        missing = [train for train in TRAINS if train not in active]
+        if not missing:
+            return
+
+        self.submit_route(route_url)
+        found = self.wait_for_trains()
+        saved_url = found.get("url") or route_url
+        available = {item["number"] for item in found.get("trains_list", [])}
+        for train in missing:
+            if train in available:
+                self.select_train(train, saved_url)
+                time.sleep(1)
+
+    def availability(self) -> dict[str, dict[str, str | bool]]:
+        self.ensure_monitoring()
+        data = self.status()
+        route_url = route_search_url()
+        result: dict[str, dict[str, str | bool]] = {}
+
+        for train in TRAINS:
+            result[train] = {
+                "selling_allowed": False,
+                "no_seats": True,
+                "available": False,
+                "log": "нет активной задачи",
+            }
+
+        for task in data.get("tasks", []):
+            train = task.get("train_number")
+            if train not in TRAINS or route_url not in (task.get("url") or ""):
+                continue
+            if task.get("status") != "monitoring":
+                continue
+            log = task.get("last_log") or ""
+            waiting = "Ожидание" in log
+            no_seats = "Мест нет" in log
+            available = not waiting and not no_seats and "мониторинг завершен" not in log
+            result[train] = {
+                "selling_allowed": True,
+                "no_seats": no_seats or waiting,
+                "available": available,
+                "log": log,
+            }
+        return result
 
 
 def load_env_file(path: Path) -> None:
@@ -171,15 +308,30 @@ def save_notified_state(path: Path, notified: set[str]) -> None:
     )
 
 
-def run_check(notified: set[str]) -> set[str]:
+def run_check(notified: set[str], *, state_file: Path) -> set[str]:
     now = datetime.now(TZ).strftime("%d.%m.%Y %H:%M:%S")
-    html = fetch_route_html()
-    status = parse_availability(html)
+
+    if use_staronki():
+        client = StaronkiClient(state_file.parent / "staronki_cookies.txt")
+        try:
+            status = client.availability()
+        finally:
+            client.save()
+        backend = "staronki.by"
+    else:
+        html = fetch_route_html()
+        status = parse_availability(html)
+        backend = "pass.rw.by"
+
     line = " | ".join(
         f"{train}: {'ЕСТЬ МЕСТА' if info['available'] else 'мест нет'}"
         for train, info in status.items()
     )
-    print(f"[{now}] {line}")
+    print(f"[{now}] ({backend}) {line}")
+    for train in TRAINS:
+        log = status[train].get("log")
+        if log:
+            print(f"  {train}: {log}")
 
     for train, info in status.items():
         if info["available"] and train not in notified:
@@ -202,7 +354,7 @@ def run_once(state_file: Path) -> int:
 
     notified = load_notified_state(state_file)
     try:
-        notified = run_check(notified)
+        notified = run_check(notified, state_file=state_file)
         save_notified_state(state_file, notified)
     except Exception as exc:  # noqa: BLE001
         print(f"Ошибка проверки: {exc}", file=sys.stderr)
@@ -226,7 +378,7 @@ def run_loop(state_file: Path) -> int:
 
     while datetime.now(TZ) < STOP_AFTER:
         try:
-            notified = run_check(notified)
+            notified = run_check(notified, state_file=state_file)
             save_notified_state(state_file, notified)
         except Exception as exc:  # noqa: BLE001
             now = datetime.now(TZ).strftime("%d.%m.%Y %H:%M:%S")

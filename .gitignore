@@ -1,4 +1,5 @@
 config.env
 .cache/
 notified.json
+staronki_cookies.txt
 __pycache__/
