@@ -1,0 +1,4 @@
+config.env
+.cache/
+notified.json
+__pycache__/
