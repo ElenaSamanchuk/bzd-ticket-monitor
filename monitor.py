@@ -24,7 +24,8 @@ FROM_STATION = "Гомель"
 TO_STATION = "Минск-Пассажирский"
 DATE = "13.07.2026"
 TRAINS = ("707Б", "757Б")
-CHECK_INTERVAL_SEC = 180  # каждые 3 минуты
+CHECK_INTERVAL_SEC = int(os.environ.get("BZD_CHECK_INTERVAL_SEC", "60"))
+HEARTBEAT_INTERVAL_SEC = int(os.environ.get("BZD_HEARTBEAT_SEC", "3600"))
 TZ = ZoneInfo("Europe/Minsk")
 STOP_AFTER = datetime(2026, 7, 13, 8, 0, tzinfo=TZ)  # утром 13.07 остановиться
 
@@ -162,18 +163,26 @@ class StaronkiClient:
             train = task.get("train_number")
             if train not in TRAINS or route_url not in (task.get("url") or ""):
                 continue
-            if task.get("status") != "monitoring":
-                continue
             log = task.get("last_log") or ""
-            waiting = "Ожидание" in log
-            no_seats = "Мест нет" in log
-            available = not waiting and not no_seats and "мониторинг завершен" not in log
-            result[train] = {
-                "selling_allowed": True,
-                "no_seats": no_seats or waiting,
-                "available": available,
-                "log": log,
-            }
+            if task.get("status") == "monitoring":
+                waiting = "Ожидание" in log
+                no_seats = "Мест нет" in log
+                available = staronki_log_has_seats(log) or (
+                    not waiting and not no_seats and "мониторинг завершен" not in log
+                )
+                result[train] = {
+                    "selling_allowed": True,
+                    "no_seats": no_seats or waiting,
+                    "available": available,
+                    "log": log,
+                }
+            elif staronki_log_has_seats(log) and not result[train]["available"]:
+                result[train] = {
+                    "selling_allowed": True,
+                    "no_seats": False,
+                    "available": True,
+                    "log": log,
+                }
         return result
 
 
@@ -204,28 +213,57 @@ def parse_availability(html: str) -> dict[str, dict[str, str | bool]]:
     """Возвращает статус по каждому поезду из TRAINS."""
     result: dict[str, dict[str, str | bool]] = {}
     row_re = re.compile(
-        r'<div class="sch-table__row"[^>]*data-ticket_selling_allowed="(true|false)"'
-        r'[^>]*data-train-number="([^"]+)"',
+        r'<div class="sch-table__row"[^>]*data-train-number="([^"]+)"[^>]*>(.*?)</div>\s*</div>\s*</div>\s*</div>',
         re.DOTALL,
     )
-    for allowed, train in row_re.findall(html):
+    for train, body in row_re.findall(html):
         if train not in TRAINS:
             continue
-        chunk_match = re.search(
-            rf'data-train-number="{re.escape(train)}".*?(?=data-train-number=|</body>)',
-            html,
-            re.DOTALL,
+        allowed_match = re.search(r'data-ticket_selling_allowed="(true|false)"', body)
+        allowed = allowed_match.group(1) if allowed_match else "false"
+        value_match = re.search(r'sch-table__tickets[^>]*data-value="(\d+)"', body)
+        data_value = int(value_match.group(1)) if value_match else 0
+        no_seats_block = bool(
+            re.search(r'sch-table__no-info[^>]*>\s*Мест нет', body, re.DOTALL)
         )
-        chunk = chunk_match.group(0) if chunk_match else ""
-        no_seats = "Мест нет" in chunk
+        has_price = bool(
+            re.search(
+                r'sch-table__price|sch-table__buy|/ru/train/\?|btn-buy|купить',
+                body,
+                re.I,
+            )
+        )
+        available = data_value > 0 or (
+            not no_seats_block and (allowed == "true" or has_price)
+        )
         result[train] = {
             "selling_allowed": allowed == "true",
-            "no_seats": no_seats,
-            "available": allowed == "true" and not no_seats,
+            "no_seats": no_seats_block and data_value == 0,
+            "available": available,
+            "data_value": data_value,
         }
     for train in TRAINS:
-        result.setdefault(train, {"selling_allowed": False, "no_seats": True, "available": False})
+        result.setdefault(
+            train,
+            {"selling_allowed": False, "no_seats": True, "available": False, "data_value": 0},
+        )
     return result
+
+
+def staronki_log_has_seats(log: str) -> bool:
+    low = log.lower()
+    if not log.strip():
+        return False
+    if "мест нет" in low or "ожидание" in low:
+        return False
+    if "мониторинг завершен" in low:
+        return False
+    if "->" in log:
+        return True
+    return any(
+        token in low
+        for token in ("есть мест", "появил", "найден", "доступн", "купить")
+    )
 
 
 def notify_macos(title: str, message: str) -> None:
@@ -290,25 +328,81 @@ def notify_all(title: str, body: str) -> None:
     notify_email(title, body)
 
 
-def load_notified_state(path: Path) -> set[str]:
+def notify_heartbeat(body: str) -> None:
+    print(f"\n>>> Отбивка\n{body}\n")
+    if os.environ.get("CI") != "true" and sys.platform == "darwin":
+        notify_macos("BZD монитор", body.split("\n", 1)[0])
+    notify_telegram(body)
+
+
+def monitor_source() -> str:
+    if os.environ.get("CI") == "true":
+        return "GitHub"
+    return "Mac"
+
+
+def load_state(path: Path) -> tuple[set[str], datetime | None]:
     if not path.exists():
-        return set()
+        return set(), None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return set(data.get("notified", []))
-    except (json.JSONDecodeError, OSError):
-        return set()
+        notified = set(data.get("notified", []))
+        last_heartbeat = None
+        raw = data.get("last_heartbeat")
+        if raw:
+            last_heartbeat = datetime.fromisoformat(raw)
+            if last_heartbeat.tzinfo is None:
+                last_heartbeat = last_heartbeat.replace(tzinfo=TZ)
+        return notified, last_heartbeat
+    except (json.JSONDecodeError, OSError, ValueError):
+        return set(), None
 
 
-def save_notified_state(path: Path, notified: set[str]) -> None:
+def save_state(
+    path: Path, notified: set[str], *, last_heartbeat: datetime | None
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, object] = {"notified": sorted(notified)}
+    if last_heartbeat is not None:
+        payload["last_heartbeat"] = last_heartbeat.isoformat()
     path.write_text(
-        json.dumps({"notified": sorted(notified)}, ensure_ascii=False, indent=2),
+        json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
 
-def run_check(notified: set[str], *, state_file: Path) -> set[str]:
+def maybe_send_heartbeat(
+    status: dict[str, dict[str, str | bool]],
+    *,
+    backend: str,
+    last_heartbeat: datetime | None,
+) -> datetime | None:
+    if HEARTBEAT_INTERVAL_SEC <= 0:
+        return last_heartbeat
+
+    now = datetime.now(TZ)
+    if (
+        last_heartbeat is not None
+        and (now - last_heartbeat).total_seconds() < HEARTBEAT_INTERVAL_SEC
+    ):
+        return last_heartbeat
+
+    line = " | ".join(
+        f"{train}: {'ЕСТЬ МЕСТА' if info['available'] else 'мест нет'}"
+        for train, info in status.items()
+    )
+    body = (
+        f"Монитор билетов работает ({monitor_source()}, {backend})\n"
+        f"{line}\n"
+        f"{FROM_STATION} → {TO_STATION}, {DATE}"
+    )
+    notify_heartbeat(body)
+    return now
+
+
+def run_check(
+    notified: set[str], *, state_file: Path
+) -> tuple[set[str], dict[str, dict[str, str | bool]], str]:
     now = datetime.now(TZ).strftime("%d.%m.%Y %H:%M:%S")
 
     if use_staronki():
@@ -344,7 +438,7 @@ def run_check(notified: set[str], *, state_file: Path) -> set[str]:
             )
             notify_all(f"Билет БЖД {train}", body)
             notified.add(train)
-    return notified
+    return notified, status, backend
 
 
 def run_once(state_file: Path) -> int:
@@ -352,10 +446,13 @@ def run_once(state_file: Path) -> int:
         print("Мониторинг завершён: дата поездки прошла.")
         return 0
 
-    notified = load_notified_state(state_file)
+    notified, last_heartbeat = load_state(state_file)
     try:
-        notified = run_check(notified, state_file=state_file)
-        save_notified_state(state_file, notified)
+        notified, status, backend = run_check(notified, state_file=state_file)
+        last_heartbeat = maybe_send_heartbeat(
+            status, backend=backend, last_heartbeat=last_heartbeat
+        )
+        save_state(state_file, notified, last_heartbeat=last_heartbeat)
     except Exception as exc:  # noqa: BLE001
         print(f"Ошибка проверки: {exc}", file=sys.stderr)
         # Не падаем в CI из-за временных сбоев / блокировки IP
@@ -371,15 +468,19 @@ def run_loop(state_file: Path) -> int:
         f"Мониторинг БЖД: {FROM_STATION} → {TO_STATION}, {DATE}\n"
         f"Поезда: {', '.join(TRAINS)}\n"
         f"Интервал: {CHECK_INTERVAL_SEC} сек.\n"
+        f"Отбивка: каждые {HEARTBEAT_INTERVAL_SEC // 60} мин.\n"
         f"Остановка: {STOP_AFTER.strftime('%d.%m.%Y %H:%M')} (Минск)\n"
     )
 
-    notified = load_notified_state(state_file)
+    notified, last_heartbeat = load_state(state_file)
 
     while datetime.now(TZ) < STOP_AFTER:
         try:
-            notified = run_check(notified, state_file=state_file)
-            save_notified_state(state_file, notified)
+            notified, status, backend = run_check(notified, state_file=state_file)
+            last_heartbeat = maybe_send_heartbeat(
+                status, backend=backend, last_heartbeat=last_heartbeat
+            )
+            save_state(state_file, notified, last_heartbeat=last_heartbeat)
         except Exception as exc:  # noqa: BLE001
             now = datetime.now(TZ).strftime("%d.%m.%Y %H:%M:%S")
             print(f"[{now}] Ошибка проверки: {exc}", file=sys.stderr)
@@ -394,12 +495,62 @@ def run_loop(state_file: Path) -> int:
     return 0
 
 
+def send_test_notify() -> int:
+    body = (
+        f"Тест: монитор билетов подключён ({monitor_source()})\n"
+        f"{FROM_STATION} → {TO_STATION}, {DATE}\n"
+        f"Поезда: {', '.join(TRAINS)}\n"
+        f"Дальше — отбивка раз в час, если всё ок."
+    )
+    notify_heartbeat(body)
+    return 0
+
+
+def send_status_alert(state_file: Path, *, reason: str) -> int:
+    notified, _ = load_state(state_file)
+    try:
+        notified, status, backend = run_check(notified, state_file=state_file)
+    except Exception as exc:  # noqa: BLE001
+        body = (
+            f"{reason}\n"
+            f"Сейчас не удалось проверить сайт: {exc}\n"
+            f"Ссылка: {route_search_url()}"
+        )
+        notify_all("BZD: проверка билетов", body)
+        return 0
+
+    line = " | ".join(
+        f"{train}: {'ЕСТЬ МЕСТА' if info['available'] else 'мест нет'}"
+        for train, info in status.items()
+    )
+    body = (
+        f"{reason}\n"
+        f"Источник: {monitor_source()}, {backend}\n"
+        f"{line}\n"
+        f"{FROM_STATION} → {TO_STATION}, {DATE}\n\n"
+        f"707Б: {buy_link('707Б')}\n"
+        f"757Б: {buy_link('757Б')}"
+    )
+    notify_all("BZD: проверка билетов", body)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Монитор билетов БЖД")
     parser.add_argument(
         "--once",
         action="store_true",
         help="Одна проверка (для GitHub Actions)",
+    )
+    parser.add_argument(
+        "--test-notify",
+        action="store_true",
+        help="Отправить тестовое сообщение в Telegram и выйти",
+    )
+    parser.add_argument(
+        "--status-alert",
+        metavar="TEXT",
+        help="Срочная проверка + сообщение в Telegram с текущим статусом",
     )
     args = parser.parse_args()
 
@@ -410,6 +561,10 @@ def main() -> int:
         os.environ.get("STATE_FILE", script_dir / ".cache/notified.json")
     )
 
+    if args.status_alert:
+        return send_status_alert(state_file, reason=args.status_alert)
+    if args.test_notify:
+        return send_test_notify()
     if args.once:
         return run_once(state_file)
     return run_loop(state_file)

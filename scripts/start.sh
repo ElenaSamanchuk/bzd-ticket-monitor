@@ -7,5 +7,6 @@ cd "$ROOT"
 
 mkdir -p .cache
 export STATE_FILE="${STATE_FILE:-$ROOT/.cache/notified.json}"
+export PYTHONUNBUFFERED=1
 
 exec caffeinate -i python3 "$ROOT/monitor.py"

@@ -28,6 +28,7 @@ jobs:
             .cache/notified.json
             .cache/staronki_cookies.txt
           key: bzd-monitor-${{ github.repository }}
+          save-always: true
 
       - name: Check tickets
         env:
