@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import html as html_module
 import http.cookiejar
 import json
 import os
@@ -24,6 +25,13 @@ FROM_STATION = "Гомель"
 TO_STATION = "Минск-Пассажирский"
 DATE = "13.07.2026"
 TRAINS = ("707Б", "757Б")
+TARGET_CLASSES = tuple(
+    c.strip()
+    for c in os.environ.get("BZD_TARGET_CLASSES", "1С").split(",")
+    if c.strip()
+)
+RW_API_KEY = os.environ.get("BZD_API_KEY", "c11f8d06e3e1594815b9c4ebaddf19a0")
+DEFAULT_TRAIN_INFO = {"from": "2100100", "to": "2100001", "date": "2026-07-13"}
 CHECK_INTERVAL_SEC = int(os.environ.get("BZD_CHECK_INTERVAL_SEC", "60"))
 HEARTBEAT_INTERVAL_SEC = int(os.environ.get("BZD_HEARTBEAT_SEC", "3600"))
 TZ = ZoneInfo("Europe/Minsk")
@@ -209,6 +217,113 @@ def fetch_route_html() -> str:
         return resp.read().decode("utf-8", errors="replace")
 
 
+def parse_train_infos(html: str) -> dict[str, dict[str, str]]:
+    infos: dict[str, dict[str, str]] = {}
+    pattern = re.compile(
+        r'data-train-info="(\{.*?\})"[^>]*>\s*'
+        r'<div class="sch-table__row"[^>]*data-train-number="([^"]+)"',
+        re.DOTALL,
+    )
+    for raw_info, train in pattern.findall(html):
+        if train not in TRAINS:
+            continue
+        try:
+            infos[train] = json.loads(html_module.unescape(raw_info))
+        except json.JSONDecodeError:
+            continue
+    for train in TRAINS:
+        infos.setdefault(train, dict(DEFAULT_TRAIN_INFO))
+    return infos
+
+
+def fetch_route_tariffs(train: str, train_info: dict[str, str]) -> dict:
+    params = {
+        "from": train_info.get("from", DEFAULT_TRAIN_INFO["from"]),
+        "to": train_info.get("to", DEFAULT_TRAIN_INFO["to"]),
+        "date": train_info.get("date", DEFAULT_TRAIN_INFO["date"]),
+        "train_number": train,
+        "user_key": RW_API_KEY,
+    }
+    url = (
+        "https://pass.rw.by/ru/ajax/route/route_tariffs/?"
+        + urllib.parse.urlencode(params)
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            **FETCH_HEADERS,
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+
+def tariff_seat_count(tariff: dict) -> int:
+    total = 0
+    for key in ("emptyPlaces", "freeSeats", "totalSeatsCount", "places"):
+        value = tariff.get(key)
+        if isinstance(value, list):
+            total = max(total, len(value))
+        elif isinstance(value, int):
+            total = max(total, value)
+        elif isinstance(value, str) and value.strip():
+            total = max(
+                total,
+                len([part for part in value.replace(";", ",").split(",") if part.strip()]),
+            )
+    for car in tariff.get("cars") or []:
+        if isinstance(car, dict):
+            total = max(total, tariff_seat_count(car))
+    return total
+
+
+def class_has_seats(tariffs_data: dict, class_code: str) -> bool:
+    for section in ("full", "short"):
+        block = tariffs_data.get(section)
+        if not isinstance(block, dict):
+            continue
+        for tariff in block.get("tariffs") or []:
+            if not isinstance(tariff, dict):
+                continue
+            abbr = tariff.get("typeAbbr") or tariff.get("serviceClassCode") or ""
+            if abbr == class_code and tariff_seat_count(tariff) > 0:
+                return True
+    return False
+
+
+def check_target_classes(
+    html: str | None,
+) -> tuple[dict[str, dict[str, str | bool | dict[str, bool]]], str]:
+    train_infos = parse_train_infos(html) if html else {t: dict(DEFAULT_TRAIN_INFO) for t in TRAINS}
+    status: dict[str, dict[str, str | bool | dict[str, bool]]] = {}
+    backend = "pass.rw.by (route_tariffs)"
+
+    for train in TRAINS:
+        classes = {code: False for code in TARGET_CLASSES}
+        try:
+            tariffs = fetch_route_tariffs(train, train_infos[train])
+            for code in TARGET_CLASSES:
+                classes[code] = class_has_seats(tariffs, code)
+        except Exception as exc:  # noqa: BLE001
+            status[train] = {
+                "available": False,
+                "classes": classes,
+                "log": f"ошибка тарифов: {exc}",
+            }
+            continue
+
+        status[train] = {
+            "available": any(classes.values()),
+            "classes": classes,
+            "log": ", ".join(
+                f"{code}: {'есть' if classes[code] else 'нет'}" for code in TARGET_CLASSES
+            ),
+        }
+    return status, backend
+
+
 def parse_availability(html: str) -> dict[str, dict[str, str | bool]]:
     """Возвращает статус по каждому поезду из TRAINS."""
     result: dict[str, dict[str, str | bool]] = {}
@@ -346,7 +461,7 @@ def load_state(path: Path) -> tuple[set[str], datetime | None]:
         return set(), None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        notified = set(data.get("notified", []))
+        notified = set(data.get("notified_target", data.get("notified", [])))
         last_heartbeat = None
         raw = data.get("last_heartbeat")
         if raw:
@@ -362,13 +477,34 @@ def save_state(
     path: Path, notified: set[str], *, last_heartbeat: datetime | None
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload: dict[str, object] = {"notified": sorted(notified)}
+    payload: dict[str, object] = {"notified_target": sorted(notified)}
     if last_heartbeat is not None:
         payload["last_heartbeat"] = last_heartbeat.isoformat()
     path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def format_status_line(status: dict[str, dict[str, str | bool | dict[str, bool]]]) -> str:
+    parts: list[str] = []
+    for train, info in status.items():
+        classes = info.get("classes") or {}
+        if classes:
+            class_line = ", ".join(
+                f"{code}: {'ЕСТЬ' if classes.get(code) else 'нет'}"
+                for code in TARGET_CLASSES
+            )
+            parts.append(f"{train} ({class_line})")
+        else:
+            parts.append(
+                f"{train}: {'ЕСТЬ МЕСТА' if info.get('available') else 'мест нет'}"
+            )
+    return " | ".join(parts)
+
+
+def notify_key(train: str, class_code: str) -> str:
+    return f"{train}:{class_code}"
 
 
 def maybe_send_heartbeat(
@@ -387,12 +523,10 @@ def maybe_send_heartbeat(
     ):
         return last_heartbeat
 
-    line = " | ".join(
-        f"{train}: {'ЕСТЬ МЕСТА' if info['available'] else 'мест нет'}"
-        for train, info in status.items()
-    )
+    line = format_status_line(status)
     body = (
         f"Монитор билетов работает ({monitor_source()}, {backend})\n"
+        f"Классы: {', '.join(TARGET_CLASSES)}\n"
         f"{line}\n"
         f"{FROM_STATION} → {TO_STATION}, {DATE}"
     )
@@ -402,25 +536,21 @@ def maybe_send_heartbeat(
 
 def run_check(
     notified: set[str], *, state_file: Path
-) -> tuple[set[str], dict[str, dict[str, str | bool]], str]:
+) -> tuple[set[str], dict[str, dict[str, str | bool | dict[str, bool]]], str]:
     now = datetime.now(TZ).strftime("%d.%m.%Y %H:%M:%S")
 
-    if use_staronki():
-        client = StaronkiClient(state_file.parent / "staronki_cookies.txt")
-        try:
-            status = client.availability()
-        finally:
-            client.save()
-        backend = "staronki.by"
-    else:
+    html: str | None = None
+    if not use_staronki():
         html = fetch_route_html()
-        status = parse_availability(html)
-        backend = "pass.rw.by"
+        status, backend = check_target_classes(html)
+    else:
+        try:
+            html = fetch_route_html()
+        except Exception:  # noqa: BLE001
+            html = None
+        status, backend = check_target_classes(html)
 
-    line = " | ".join(
-        f"{train}: {'ЕСТЬ МЕСТА' if info['available'] else 'мест нет'}"
-        for train, info in status.items()
-    )
+    line = format_status_line(status)
     print(f"[{now}] ({backend}) {line}")
     for train in TRAINS:
         log = status[train].get("log")
@@ -428,16 +558,22 @@ def run_check(
             print(f"  {train}: {log}")
 
     for train, info in status.items():
-        if info["available"] and train not in notified:
+        classes = info.get("classes") or {}
+        for class_code, has_seats in classes.items():
+            if not has_seats:
+                continue
+            key = notify_key(train, class_code)
+            if key in notified:
+                continue
             body = (
-                f"Появились билеты!\n"
+                f"Появились билеты {class_code}!\n"
                 f"Поезд {train}\n"
                 f"{FROM_STATION} → {TO_STATION}\n"
                 f"Дата: {DATE}\n\n"
                 f"Купить: {buy_link(train)}"
             )
-            notify_all(f"Билет БЖД {train}", body)
-            notified.add(train)
+            notify_all(f"Билет БЖД {train} {class_code}", body)
+            notified.add(key)
     return notified, status, backend
 
 
@@ -458,8 +594,9 @@ def run_once(state_file: Path) -> int:
         # Не падаем в CI из-за временных сбоев / блокировки IP
         return 0
 
-    if len(notified) == len(TRAINS):
-        print("Оба поезда уже с местами — уведомления отправлены.")
+    if len(notified) >= len(TRAINS) * len(TARGET_CLASSES):
+        print("Уведомления по всем целевым классам уже отправлены.")
+
     return 0
 
 
@@ -467,6 +604,7 @@ def run_loop(state_file: Path) -> int:
     print(
         f"Мониторинг БЖД: {FROM_STATION} → {TO_STATION}, {DATE}\n"
         f"Поезда: {', '.join(TRAINS)}\n"
+        f"Классы: {', '.join(TARGET_CLASSES)}\n"
         f"Интервал: {CHECK_INTERVAL_SEC} сек.\n"
         f"Отбивка: каждые {HEARTBEAT_INTERVAL_SEC // 60} мин.\n"
         f"Остановка: {STOP_AFTER.strftime('%d.%m.%Y %H:%M')} (Минск)\n"
@@ -485,10 +623,6 @@ def run_loop(state_file: Path) -> int:
             now = datetime.now(TZ).strftime("%d.%m.%Y %H:%M:%S")
             print(f"[{now}] Ошибка проверки: {exc}", file=sys.stderr)
 
-        if len(notified) == len(TRAINS):
-            print("Оба поезда с местами — мониторинг завершён.")
-            return 0
-
         time.sleep(CHECK_INTERVAL_SEC)
 
     print("Время вышло — мониторинг остановлен.")
@@ -497,10 +631,10 @@ def run_loop(state_file: Path) -> int:
 
 def send_test_notify() -> int:
     body = (
-        f"Тест: монитор билетов подключён ({monitor_source()})\n"
+        f"Монитор билетов: ищу класс {', '.join(TARGET_CLASSES)} ({monitor_source()})\n"
         f"{FROM_STATION} → {TO_STATION}, {DATE}\n"
         f"Поезда: {', '.join(TRAINS)}\n"
-        f"Дальше — отбивка раз в час, если всё ок."
+        f"Отбивка раз в час, если всё ок."
     )
     notify_heartbeat(body)
     return 0
@@ -519,10 +653,7 @@ def send_status_alert(state_file: Path, *, reason: str) -> int:
         notify_all("BZD: проверка билетов", body)
         return 0
 
-    line = " | ".join(
-        f"{train}: {'ЕСТЬ МЕСТА' if info['available'] else 'мест нет'}"
-        for train, info in status.items()
-    )
+    line = format_status_line(status)
     body = (
         f"{reason}\n"
         f"Источник: {monitor_source()}, {backend}\n"

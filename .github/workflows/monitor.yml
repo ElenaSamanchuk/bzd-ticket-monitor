@@ -13,6 +13,7 @@ jobs:
     env:
       CI: "true"
       BZD_USE_STARONKI: "1"
+      BZD_TARGET_CLASSES: "1С"
       STATE_FILE: .cache/notified.json
       EMAIL_TO: elenasamanchuk@gmail.com
       EMAIL_FROM: elenasamanchuk@gmail.com
